@@ -18,9 +18,9 @@
 #define MAX_MENU_ITEMS 10
 #define MAX_DEPTH 10
 
-#define ENC_CLK_PIN 7
+#define ENC_CLK_PIN 9
 #define ENC_DAT_PIN 8
-#define ENC_BUT_PIN 9
+#define ENC_BUT_PIN 7
 #define TEMP_PIN 6
 #define POWER_ON_PIN 10
 
@@ -797,9 +797,6 @@ void setup() {
   static Menu _menu(&top);
   menu = &_menu;
   menu->render();
-  /*menu->registerValue(a);
-  menu->registerValue(b);
-  menu->registerValue(c);*/
   Serial.println("Done setup");
 }
 
@@ -813,7 +810,6 @@ void loop() {
     //temp = TK;
     //test = r;
     if (_button) {
-      DEBUG_PRINT("FREEDOM!");
       menu->button();
       _button=0;
     }
