@@ -11,6 +11,10 @@
 #define OLED_RESET -1
 #define SCREEN_ADDRESS 0x3C
 
+#define TEMP_ADDRESS 0x44
+#define TEMP_COLLECT_COMMAND_HIGH 0x24
+#define TEMP_COLLECT_COMMAND_LOW 0x00 // high repeatability, clock stretching disabled
+
 #define MAX_RENDERER_WIDTH 32
 #define MAX_RENDERER_BUFFER MAX_RENDERER_WIDTH + 1
 #define MAX_RENDERER_HEIGHT 4
@@ -34,7 +38,7 @@
 #endif
 
 #define TIMER_IRQ_INTERVAL_MS 5 // how often timer irq fires
-#define TEMP_READ_INTERVAL 10 // how often the temp is read
+#define TEMP_READ_INTERVAL 30 // how often the temp is read
 #define TEMP_READ_BUFFER_SIZE 100 // how many temp reads are buffered and averaged
 #define PID_INTERVAL_LEN_MS 1000 // total time of the power on loop
 #define DISPLAY_REFRESH_INTERVAL 50 // how often display should refresh
@@ -54,8 +58,10 @@ volatile int dn = 0;
 volatile int n = 0;
 volatile int button = 0;
 volatile bool refreshDisplay = false;
+volatile bool doReadTemp = false;
 volatile int power = 0;
 volatile float TK = 0;
+float humidity = 0;
 volatile float r = 0;
 volatile float temps[TEMP_READ_BUFFER_SIZE] = {-1};
 float temp = 0;
@@ -78,7 +84,7 @@ enum MenuReturn {
   RENDER,
 };
 
-void readTemp() {
+void readTempOld() {
   static int currentInterval = 0;
   int nIntervals = TEMP_READ_INTERVAL / TIMER_IRQ_INTERVAL_MS;
   if (!currentInterval) {
@@ -101,6 +107,66 @@ void readTemp() {
     TK = sum / i;
   }
   currentInterval = (currentInterval + 1) % nIntervals;
+}
+
+void readTemp() {
+  static int currentInterval = 0;
+  int nIntervals = TEMP_READ_INTERVAL / TIMER_IRQ_INTERVAL_MS;
+  
+  if (currentInterval) {
+    currentInterval = (currentInterval + 1) % nIntervals;
+    return;
+  }
+
+  currentInterval = (currentInterval + 1) % nIntervals;
+  doReadTemp = true;
+}
+
+void _readTemp() {
+
+  doReadTemp = false;
+  
+  // read from the sensor
+  Wire.requestFrom(TEMP_ADDRESS, 6);
+  int v = Wire.available();
+  if (v !=  6) {
+    DEBUG_PRINT("No data");
+    DEBUG_PRINT(v);
+    Wire.beginTransmission(TEMP_ADDRESS);
+    byte cmd[2] = {TEMP_COLLECT_COMMAND_HIGH, TEMP_COLLECT_COMMAND_LOW};
+    DEBUG_PRINT(Wire.write(cmd, 2));
+    Wire.endTransmission();
+    return;
+  }
+
+  // read temp
+  uint16_t tRaw = (uint16_t) Wire.read() << 8;
+  tRaw |= Wire.read();
+
+  // toss crc for now
+  Wire.read();
+
+  // read humidity
+  uint16_t hRaw = (uint16_t) Wire.read() << 8;
+  hRaw |= Wire.read();
+
+  // toss the crc again
+  Wire.read();
+
+  
+
+  TK = 175 * (float)tRaw/65535 + 273.15 - 45;
+  DEBUG_PRINT(TK);
+
+  
+  humidity = 100*(float)hRaw/65535;
+  DEBUG_PRINT(humidity);
+
+  // send the command to start collecting the next data point
+  Wire.beginTransmission(TEMP_ADDRESS);
+  byte cmd[2] = {TEMP_COLLECT_COMMAND_HIGH, TEMP_COLLECT_COMMAND_LOW};
+  Wire.write(cmd, 2);
+  Wire.endTransmission();
 }
 
 void save() {
@@ -186,7 +252,7 @@ class Renderer {
     Renderer(uint8_t nLines) : nLines_(nLines), viewPos_(0), scrollPos_(0) {}
     virtual void render(char lines[MAX_MENU_ITEMS][MAX_RENDERER_BUFFER], uint8_t nItems) = 0;
     void scrollUp() {
-      DEBUG_PRINT("Renderer scrollUp");
+      //DEBUG_PRINT("Renderer scrollUp");
       if (scrollPos_ == 0) {
         if (viewPos_ > 0) {
           viewPos_--;
@@ -196,7 +262,7 @@ class Renderer {
       }
     }
     void scrollDown(uint8_t nItems) {
-      DEBUG_PRINT("Renderer scrollDown");
+      //DEBUG_PRINT("Renderer scrollDown");
       // scrollPos not at end of screen
       if (scrollPos_ == nLines_ - 1) {
         // and not at end of view move view down
@@ -235,7 +301,7 @@ class SSD1306Renderer32x128 : public Renderer {
       display_(display), \
       textSize_(textSize) {}
     void render(char lines[MAX_MENU_ITEMS][MAX_RENDERER_BUFFER], uint8_t nItems) {
-      DEBUG_PRINT("Renderer render");
+      //DEBUG_PRINT("Renderer render");
       display_->clearDisplay();
       display_->setCursor(0, 0);
       display_->setTextSize(textSize_);
@@ -244,10 +310,10 @@ class SSD1306Renderer32x128 : public Renderer {
       //  viewPos_ = nItems - nLines_ - 1;
       //}
       for (uint8_t i = 0; i < nItems && i < nLines_; i++) {
-        DEBUG_PRINT("Printing");
-        DEBUG_PRINT(lines[viewPos_ + i]);
-        DEBUG_PRINT("View Pos:");
-        DEBUG_PRINT(viewPos_);
+        //DEBUG_PRINT("Printing");
+        //DEBUG_PRINT(lines[viewPos_ + i]);
+        //DEBUG_PRINT("View Pos:");
+        //DEBUG_PRINT(viewPos_);
         display_->println(lines[viewPos_ + i]);
       }
       display_->display();
@@ -349,6 +415,7 @@ class FloatValue : public MenuItem {
       currentDigitIndex_(0),
       tempValue_(0),
       digits_({0}) {}
+      
     MenuReturn up() { 
       if (negIndex_) {
         neg_ = !neg_;
@@ -373,17 +440,17 @@ class FloatValue : public MenuItem {
       neg_ = *v_ < 0;
       negIndex_ = true;
       float tmp = abs(*v_);
-      currentDigit_ = 0;
       tempValue_ = 0;
       currentDigitIndex_ = 0;
-      DEBUG_PRINT("Select digits:");
-      for(int i = 0; i < nDigits_; i++) {
-        float ten = pow(10, nDigits_ - decimalLocation_ - i - 2);
+      //DEBUG_PRINT("Select digits:");
+      for(int i = 0; i <= nDigits_; i++) {
+        float ten = pow(10, decimalLocation_ - i - 1);
         uint8_t digit = floor(tmp / ten);
-        DEBUG_PRINT(digit);
+        //DEBUG_PRINT(digit);
         tmp -= ten * digit;
         digits_[i] = digit;
       }
+      currentDigit_ = digits_[0];
       return ENTER;
     }
     
@@ -391,10 +458,10 @@ class FloatValue : public MenuItem {
       if (negIndex_) {
         negIndex_ = false;
       } else {
-        DEBUG_PRINT("Power:");
-        DEBUG_PRINT(nDigits_ - decimalLocation_ - currentDigitIndex_ - 2);
-        tempValue_ += currentDigit_ * pow(10, nDigits_ - decimalLocation_ - currentDigitIndex_ - 2);
-        DEBUG_PRINT(tempValue_);
+        //DEBUG_PRINT("Power:");
+        //DEBUG_PRINT(nDigits_ - decimalLocation_ - currentDigitIndex_ - 2);
+        tempValue_ += currentDigit_ * pow(10, decimalLocation_ - currentDigitIndex_ - 1);
+        //DEBUG_PRINT(tempValue_);
         digits_[currentDigitIndex_] = currentDigit_;
         currentDigitIndex_++;
         currentDigit_ = digits_[currentDigitIndex_];
@@ -432,6 +499,7 @@ class FloatValue : public MenuItem {
       snprintf(lines[0], MAX_RENDERER_BUFFER, "%s", s);
       renderer_->render(lines, 1);
     }
+
     void preview(char s[MAX_RENDERER_BUFFER], uint8_t previewLen) {
       uint8_t max_size = min(previewLen, MAX_RENDERER_BUFFER);
       snprintf(s, max_size, "%s: %.3f", name_, *v_);
@@ -530,8 +598,8 @@ class ScrollMenu : public MenuItem {
         }
     }
     MenuReturn up() {
-      DEBUG_PRINT("ScrollMenu up");
-      DEBUG_PRINT(cursorPos_);
+      //DEBUG_PRINT("ScrollMenu up");
+      //DEBUG_PRINT(cursorPos_);
       if (cursorPos_ > 0) {
         cursorPos_--;
         renderer_->scrollUp();
@@ -540,8 +608,8 @@ class ScrollMenu : public MenuItem {
       return NOTHING;
     }
     MenuReturn down() {
-      DEBUG_PRINT("ScrollMenu down");
-      DEBUG_PRINT(cursorPos_);
+      //DEBUG_PRINT("ScrollMenu down");
+      //DEBUG_PRINT(cursorPos_);
       if (cursorPos_ < nItems_ - 1) {
         cursorPos_ ++;
         renderer_->scrollDown(nItems_);
@@ -553,7 +621,7 @@ class ScrollMenu : public MenuItem {
       return ENTER;
     }
     MenuReturn button() {
-      DEBUG_PRINT("ScrollMenu button");
+      //DEBUG_PRINT("ScrollMenu button");
       return SELECT;
     }
     MenuItem* getItem() {
@@ -563,7 +631,7 @@ class ScrollMenu : public MenuItem {
       snprintf(s, min(previewLen, MAX_RENDERER_BUFFER), "%s", name_);
     }
     void render() {
-      DEBUG_PRINT("ScrollMenu render");
+      //DEBUG_PRINT("ScrollMenu render");
       refresh();
       renderer_->render(lines_, nItems_);
     }
@@ -585,9 +653,9 @@ class ScrollMenu : public MenuItem {
         char linePreview[MAX_RENDERER_BUFFER - 1];
         items_[i]->preview(linePreview, MAX_RENDERER_BUFFER - 1);
         snprintf(lines_[i], MAX_RENDERER_BUFFER, "%c%s", cursor, linePreview);
-        DEBUG_PRINT("Preview:");
-        DEBUG_PRINT(linePreview);
-        DEBUG_PRINT(lines_[i]);
+        //DEBUG_PRINT("Preview:");
+        //DEBUG_PRINT(linePreview);
+        //DEBUG_PRINT(lines_[i]);
       }
     }
 };
@@ -596,20 +664,20 @@ class Menu {
   public:
     Menu(MenuItem* topItem) : stackLen_(1) { stack_[0] = topItem; }
     void up() {
-      DEBUG_PRINT("Menu up");
+      //DEBUG_PRINT("Menu up");
       act(stack_[0], stack_[0]->up());
     }
     void down() {
-      DEBUG_PRINT("Menu down");
+      //DEBUG_PRINT("Menu down");
       act(stack_[0], stack_[0]->down());
     }
     void button() {
-      DEBUG_PRINT("Menu button");
+      //DEBUG_PRINT("Menu button");
       MenuReturn r = stack_[0]->button();
       act(stack_[0], r);
     }
     void render() {
-      DEBUG_PRINT("Menu render");
+      //DEBUG_PRINT("Menu render");
       stack_[0]->render();
     }
     void refresh() {
@@ -621,8 +689,8 @@ class Menu {
     MenuItem* stack_[MAX_DEPTH];
     uint8_t stackLen_;
     bool pushStack(MenuItem* item) {
-      DEBUG_PRINT("Push stack");
-      DEBUG_PRINT(stackLen_);
+      //DEBUG_PRINT("Push stack");
+      //DEBUG_PRINT(stackLen_);
       if (stackLen_ == MAX_DEPTH) {
         return false;
       }
@@ -648,20 +716,20 @@ class Menu {
 
     void act(MenuItem* item, MenuReturn r) {
       MenuItem* i = item->getItem();
-      DEBUG_PRINT("Act");
+      //DEBUG_PRINT("Act");
       switch (r) {
         case SELECT:
-          DEBUG_PRINT("Select");
+          //DEBUG_PRINT("Select");
           if (i != NULL) {
             act(i, i->select());
           }
           break;
         case ENTER:
-          DEBUG_PRINT("Enter");
+          //DEBUG_PRINT("Enter");
           if (pushStack(item)) stack_[0]->render();
           break;
         case BACK:
-          DEBUG_PRINT("Back");
+          //DEBUG_PRINT("Back");
           popStack();
           stack_[0]->render();
           break;
@@ -781,19 +849,25 @@ void setup() {
     DEBUG_PRINT("Timer attached");
   }
 
+  Wire.beginTransmission(TEMP_ADDRESS);
+  byte cmd[2] = {TEMP_COLLECT_COMMAND_HIGH, TEMP_COLLECT_COMMAND_LOW};
+  Wire.write(cmd, 2);
+  Wire.endTransmission();
+
   static int bVal = 1;
   static int cVal = 2;
   static OutputVolIntValue p("Power", NULL, &power);
   static OutputFloatValue t_("Temp C", NULL, &temp);
+  static OutputFloatValue h("Humidity %", NULL, &humidity);
   static BoundedIntValue s("Set Point C", &r2, &set, 20, 80);
   static FloatValue a("Kp", &r2, &Kp, 5, 2);
   static FloatValue b("Ki", &r2, &Ki, 5, 2);
-  static FloatValue c("Kd", &r2, &Kd, 5, 2);
+  static FloatValue c("Kd", &r2, &Kd, 5, 3);
   static ToggleItem t("power", NULL, &on, "Power: on", "Power: off");
   static Save saveButton("Save", NULL);
   static Load loadButton("Load", NULL);
-  static MenuItem* items[] = {&p, &t_, &s, &a, &b, &c, &t, &saveButton, &loadButton};
-  static ScrollMenu top("Top", &r1, items, 9);
+  static MenuItem* items[] = {&p, &t_, &h ,&s, &a, &b, &c, &t, &saveButton, &loadButton};
+  static ScrollMenu top("Top", &r1, items, 10);
   static Menu _menu(&top);
   menu = &_menu;
   menu->render();
@@ -815,6 +889,9 @@ void loop() {
     }
     if (refreshDisplay) {
       menu->refresh();
+    }
+    if (doReadTemp) {
+      _readTemp();
     }
     refreshDisplay = false;
     if (_dn == 0) {
